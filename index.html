@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <title>阿瓦隆记牌器</title>
+
+  <!-- PWA -->
+  <link rel="manifest" href="manifest.webmanifest" />
+  <meta name="theme-color" content="#1e2952" />
+
+  <!-- iOS 添加到主屏幕 -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="记牌器" />
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="title">阿瓦隆记牌器</div>
+    <div class="tools">
+      <div class="stepper" aria-label="人数">
+        <button id="count-dec" class="step-btn" type="button">−</button>
+        <span class="step-val"><span id="count-val">10</span>人</span>
+        <button id="count-inc" class="step-btn" type="button">+</button>
+      </div>
+      <button id="btn-new" class="tool-btn" type="button">新开一局</button>
+      <button id="btn-rollback" class="tool-btn" type="button">回溯上一局</button>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="identity" type="button">身份标记</button>
+    <button class="tab" data-tab="rounds" type="button">每轮记录</button>
+  </nav>
+
+  <main>
+    <section id="tab-identity" class="tab-panel">
+      <div id="identity-list" class="identity-list"></div>
+    </section>
+
+    <section id="tab-rounds" class="tab-panel hidden">
+      <button id="btn-add-round" class="primary-btn" type="button">＋ 添加一轮</button>
+      <div id="rounds-list" class="rounds-list"></div>
+    </section>
+  </main>
+
+  <!-- 底部弹层 -->
+  <div id="sheet-overlay" class="overlay hidden">
+    <div id="sheet" class="sheet" role="dialog" aria-modal="true">
+      <div class="sheet-head">
+        <div id="sheet-title" class="sheet-title"></div>
+        <button id="sheet-close" class="sheet-close" type="button">完成</button>
+      </div>
+      <div id="sheet-body" class="sheet-body"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
