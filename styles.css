@@ -22,7 +22,7 @@
   --reject: #c0392b;
 }
 
-* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; touch-action: manipulation;}
 
 html, body {
   margin: 0;
