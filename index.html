@@ -19,6 +19,19 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+  <!-- 密码锁屏：默认显示，验证通过或 8 小时内已解锁则隐藏 -->
+  <div id="lock-screen" class="lock">
+    <div class="lock-box">
+      <div class="lock-icon">🔒</div>
+      <div class="lock-title">阿瓦隆记牌器</div>
+      <div class="lock-sub">输入密码解锁（8 小时内免再输）</div>
+      <input id="lock-input" class="lock-input" type="password" inputmode="text"
+             autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="密码" />
+      <button id="lock-btn" class="lock-btn" type="button">解锁</button>
+      <div id="lock-err" class="lock-err"></div>
+    </div>
+  </div>
+
   <header class="topbar">
     <div class="title">阿瓦隆记牌器</div>
     <div class="tools">
@@ -29,12 +42,14 @@
       </div>
       <button id="btn-new" class="tool-btn" type="button">新开一局</button>
       <button id="btn-rollback" class="tool-btn" type="button">回溯上一局</button>
+      <button id="btn-lock" class="tool-btn" type="button">🔒 锁定</button>
     </div>
   </header>
 
   <nav class="tabs">
     <button class="tab active" data-tab="identity" type="button">身份标记</button>
     <button class="tab" data-tab="rounds" type="button">每轮记录</button>
+    <button class="tab" data-tab="result" type="button">结果 / 导出</button>
   </nav>
 
   <main>
@@ -45,6 +60,10 @@
     <section id="tab-rounds" class="tab-panel hidden">
       <button id="btn-add-round" class="primary-btn" type="button">＋ 添加一轮</button>
       <div id="rounds-list" class="rounds-list"></div>
+    </section>
+
+    <section id="tab-result" class="tab-panel hidden">
+      <div id="result-panel" class="result-panel"></div>
     </section>
   </main>
 

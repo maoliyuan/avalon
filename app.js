@@ -5,10 +5,13 @@
  * ============================================================ */
 
 /* 可标记的身份清单：想增删角色，直接改这个数组即可 */
-const IDENTITIES = ['好人', '坏人', '梅林', '派西维尔', '忠臣', '刺客', '莫甘娜', '莫德雷德', '奥伯伦', '爪牙'];
+const IDENTITIES = ['好人', '坏人', '梅林', '派西维尔', '忠臣', '刺客', '莫甘娜', '莫德雷德', '奥伯伦', '爪牙', '蓝兰斯洛特', '红兰斯洛特'];
 
-/* 四档确定度（可叠加，一个号码可挂多条） */
+/* 确定度（可叠加，一个号码可挂多条）
+ * 「最终是」= 揭底后的真实身份（金色），是喂给下游分析的「标准答案」标签；
+ * 其余四档是主观猜测。 */
 const CERTAINTIES = [
+  { code: 'final',    label: '最终是',   glyph: '★' },
   { code: 'is',       label: '确定是',   glyph: '✓' },
   { code: 'maybe',    label: '可能是',   glyph: '?' },
   { code: 'maybenot', label: '可能不是', glyph: '?' },
@@ -20,20 +23,95 @@ const MIN_PLAYERS = 5;
 const MAX_PLAYERS = 12;
 const LS_KEY = 'avalon_tracker_v1';
 
+/* ---------------- 密码闸门（纯客户端，仅用于挡住路人）----------------
+ * 注意：静态网页无后端，此校验可被懂技术者绕过；仅防随手乱点。
+ * PASSWORD_HASH = 你的密码的 SHA-256（十六进制小写）。
+ *   当前是临时密码「avalon」，请务必改成你自己的：
+ *   Mac 终端执行：  printf '你的密码' | shasum -a 256
+ *   把输出前面那串 64 位十六进制粘到下面即可（不要带空格和文件名）。
+ */
+const PASSWORD_HASH = '657cd4d68c6a6e51740f32894b11446e720096f954c4faa6b7bdb708e4b8e215';
+const AUTH_KEY = 'avalon_auth_v1';
+const UNLOCK_HOURS = 8;
+
 /* ---------------- 数据模型 ---------------- */
+let idSeq = 0;
+function genId(prefix) { return prefix + Date.now().toString(36) + (idSeq++).toString(36); }
+
+function freshResult() {
+  return { winner: null, missions: [], assassinTarget: null, assassinHitMerlin: null };
+}
 function freshGame(count) {
-  return { playerCount: count || 10, players: {}, rounds: [] };
+  return {
+    id: genId('g'),
+    createdAt: new Date().toISOString(),
+    playerCount: count || 10,
+    players: {},        // 号码 -> { tags:[{c,id}] }
+    rounds: [],
+    seats: {},          // 座位号 -> 真实玩家 id
+    result: freshResult(),
+  };
+}
+/* 兼容旧存档：补齐后加的字段 */
+function migrateGame(g) {
+  if (!g) return g;
+  if (!g.id) g.id = genId('g');
+  if (!g.createdAt) g.createdAt = new Date().toISOString();
+  if (!g.players) g.players = {};
+  if (!Array.isArray(g.rounds)) g.rounds = [];
+  if (!g.seats) g.seats = {};
+  if (!g.result) g.result = freshResult();
+  return g;
 }
 function loadStore() {
   try {
     const s = JSON.parse(localStorage.getItem(LS_KEY));
-    if (s && s.current && Array.isArray(s.current.rounds)) return s;
+    if (s && s.current && Array.isArray(s.current.rounds)) {
+      s.roster = Array.isArray(s.roster) ? s.roster : [];
+      s.archive = Array.isArray(s.archive) ? s.archive : [];
+      migrateGame(s.current);
+      if (s.previous) migrateGame(s.previous);
+      s.archive.forEach(migrateGame);
+      return s;
+    }
   } catch (e) { /* 损坏则重建 */ }
-  return { current: freshGame(10), previous: null };
+  return { current: freshGame(10), previous: null, roster: [], archive: [] };
 }
 let store = loadStore();
 function save() { localStorage.setItem(LS_KEY, JSON.stringify(store)); }
 function G() { return store.current; }
+
+/* ---------------- 真实玩家名册 & 座位指派 ---------------- */
+function personName(id) { const p = store.roster.find(x => x.id === id); return p ? p.name : null; }
+function addPerson(name) {
+  name = (name || '').trim();
+  if (!name) return null;
+  const p = { id: genId('p'), name };
+  store.roster.push(p); save(); return p;
+}
+function renamePerson(id, name) {
+  name = (name || '').trim(); if (!name) return;
+  const p = store.roster.find(x => x.id === id);
+  if (p) { p.name = name; save(); }
+}
+function deletePerson(id) {
+  store.roster = store.roster.filter(x => x.id !== id);
+  const unbind = g => { if (g && g.seats) Object.keys(g.seats).forEach(k => { if (g.seats[k] === id) delete g.seats[k]; }); };
+  unbind(store.current); unbind(store.previous); (store.archive || []).forEach(unbind);
+  save();
+}
+function seatPerson(num) { return G().seats[num] || null; }
+function assignSeat(num, personId) {
+  const g = G();
+  if (personId) {
+    // 同一个人一局只占一个座位：先从其它座位解绑
+    Object.keys(g.seats).forEach(k => { if (g.seats[k] === personId) delete g.seats[k]; });
+    g.seats[num] = personId;
+  } else {
+    delete g.seats[num];
+  }
+  save();
+}
 
 /* 身份标记操作 */
 function tagsOf(num) {
@@ -94,12 +172,13 @@ let activeTab = 'identity';
 function render() {
   $('#count-val').textContent = G().playerCount;
   $('#btn-rollback').disabled = !store.previous;
-  $('#tab-identity').classList.toggle('hidden', activeTab !== 'identity');
-  $('#tab-rounds').classList.toggle('hidden', activeTab !== 'rounds');
+  ['identity', 'rounds', 'result'].forEach(t =>
+    $('#tab-' + t).classList.toggle('hidden', activeTab !== t));
   document.querySelectorAll('.tab').forEach(b =>
     b.classList.toggle('active', b.dataset.tab === activeTab));
   if (activeTab === 'identity') renderIdentity();
-  else renderRounds();
+  else if (activeTab === 'rounds') renderRounds();
+  else renderResult();
 }
 
 function chipEl(num, tag, idx) {
@@ -120,9 +199,17 @@ function renderIdentity() {
     if (tags.length === 0) chips.append(el('span', { class: 'empty-tags' }, '暂无标记'));
     else tags.forEach((t, i) => chips.append(chipEl(num, t, i)));
 
+    const pid = seatPerson(num);
+    const seatBtn = el('button', {
+      class: 'seat-btn' + (pid ? ' has' : ''), type: 'button',
+      onclick: () => openSeatSheet(num)
+    }, pid ? personName(pid) : '指派玩家');
+
     box.append(el('div', { class: 'pcard' },
       el('div', { class: 'pcard-head' },
-        el('div', { class: 'pnum' }, String(num), el('small', {}, '号')),
+        el('div', { class: 'pnum-wrap' },
+          el('div', { class: 'pnum' }, String(num), el('small', {}, '号')),
+          seatBtn),
         el('button', { class: 'add-tag', type: 'button', onclick: () => openTagSheet(num) }, '＋ 标记')),
       chips));
   }
@@ -338,8 +425,9 @@ function changeCount(delta) {
 }
 
 function newGame() {
-  if (!confirm('新开一局？当前记录会存为「上一局」，可用「回溯上一局」找回。')) return;
+  if (!confirm('新开一局？当前记录会存档（可在「结果 / 导出」页「导出全部」找回），也可用「回溯上一局」切回上一局。')) return;
   const count = G().playerCount;
+  archiveCurrent();
   store.previous = store.current;
   store.current = freshGame(count);
   save();
@@ -358,6 +446,260 @@ function rollback() {
   toast('已切换到上一局（再点一次可切回）');
 }
 
+/* ---------------- 座位指派弹层 ---------------- */
+function openSeatSheet(num) { renderSeatSheet(num, openSheet(num + ' 号 是谁')); }
+function renderSeatSheet(num, body) {
+  body.textContent = '';
+  const cur = seatPerson(num);
+  const list = el('div', { class: 'opt-row' });
+  if (store.roster.length === 0) list.append(el('span', { class: 'empty-tags' }, '名册为空，点下面「＋ 新增真实玩家」。'));
+  store.roster.forEach(p => {
+    const sel = cur === p.id;
+    list.append(el('button', {
+      class: 'opt' + (sel ? ' sel-is' : ''), type: 'button',
+      onclick: () => { assignSeat(num, sel ? null : p.id); renderSeatSheet(num, body); renderIdentity(); }
+    }, p.name));
+  });
+  const addBtn = el('button', {
+    class: 'opt', type: 'button', style: 'border-style:dashed; color:var(--gold);',
+    onclick: () => {
+      const name = prompt('新增真实玩家名字：');
+      if (name && name.trim()) { const p = addPerson(name); assignSeat(num, p.id); renderSeatSheet(num, body); renderIdentity(); }
+    }
+  }, '＋ 新增真实玩家');
+  body.append(
+    el('div', { class: 'sheet-section' },
+      el('div', { class: 'sec-label' }, '点名字指派给 ' + num + ' 号（同一人一局只占一个座位；再点一次取消）'), list),
+    el('div', { class: 'sheet-section' }, addBtn),
+    cur ? el('div', { class: 'sheet-section' },
+      el('button', { class: 'mini-btn', type: 'button', onclick: () => { assignSeat(num, null); renderSeatSheet(num, body); renderIdentity(); } }, '清除指派')) : null
+  );
+}
+
+/* ---------------- 名册管理弹层 ---------------- */
+function openRosterSheet() { renderRosterSheet(openSheet('真实玩家名册')); }
+function renderRosterSheet(body) {
+  body.textContent = '';
+  const list = el('div', { class: 'roster-list' });
+  if (store.roster.length === 0) list.append(el('span', { class: 'empty-tags' }, '还没有登记任何人。'));
+  store.roster.forEach(p => {
+    list.append(el('div', { class: 'roster-row' },
+      el('span', { class: 'roster-name' }, p.name),
+      el('div', { class: 'ract' },
+        el('button', { class: 'mini-btn', type: 'button', onclick: () => { const n = prompt('改名字：', p.name); if (n && n.trim()) { renamePerson(p.id, n); renderRosterSheet(body); render(); } } }, '改名'),
+        el('button', { class: 'mini-btn', type: 'button', onclick: () => { if (confirm('删除「' + p.name + '」？会同时从所有对局的座位解绑。')) { deletePerson(p.id); renderRosterSheet(body); render(); } } }, '删除'))));
+  });
+  body.append(
+    el('div', { class: 'sheet-section' }, list),
+    el('button', { class: 'primary-btn', type: 'button', onclick: () => { const n = prompt('新增真实玩家名字：'); if (n && n.trim()) { addPerson(n); renderRosterSheet(body); } } }, '＋ 新增玩家')
+  );
+}
+
+/* ---------------- 结果 / 导出 页 ---------------- */
+function renderResult() {
+  const box = $('#result-panel');
+  box.textContent = '';
+  const g = G();
+  const res = g.result || (g.result = freshResult());
+  if (!Array.isArray(res.missions)) res.missions = [];
+
+  // 胜负
+  const winRow = el('div', { class: 'opt-row' });
+  [['good', '好人赢', 'is'], ['evil', '坏人赢', 'isnt']].forEach(([code, label, cls]) => {
+    winRow.append(el('button', {
+      class: 'opt' + (res.winner === code ? ' sel-' + cls : ''), type: 'button',
+      onclick: () => { res.winner = res.winner === code ? null : code; save(); renderResult(); }
+    }, label));
+  });
+
+  // 任务 1..5
+  const missionsWrap = el('div', { class: 'missions' });
+  for (let i = 0; i < 5; i++) {
+    const m = res.missions[i] || (res.missions[i] = { result: null, fails: null });
+    const row = el('div', { class: 'mrow' },
+      el('span', { class: 'rlabel' }, '任务' + (i + 1)),
+      el('button', { class: 'mini-btn' + (m.result === 'success' ? ' m-suc' : ''), type: 'button', onclick: () => { m.result = m.result === 'success' ? null : 'success'; if (m.result === 'success') m.fails = 0; save(); renderResult(); } }, '成功'),
+      el('button', { class: 'mini-btn' + (m.result === 'fail' ? ' m-fail' : ''), type: 'button', onclick: () => { if (m.result === 'fail') { m.result = null; m.fails = null; } else { m.result = 'fail'; if (m.fails == null || m.fails < 1) m.fails = 1; } save(); renderResult(); } }, '失败'));
+    if (m.result === 'fail') {
+      row.append(el('span', { class: 'fail-step' },
+        el('span', { class: 'vote-tag' }, '失败票'),
+        el('button', { class: 'step-btn', type: 'button', onclick: () => { m.fails = Math.max(0, (m.fails || 0) - 1); save(); renderResult(); } }, '−'),
+        el('span', { class: 'fail-n' }, String(m.fails || 0)),
+        el('button', { class: 'step-btn', type: 'button', onclick: () => { m.fails = (m.fails || 0) + 1; save(); renderResult(); } }, '＋')));
+    }
+    missionsWrap.append(row);
+  }
+
+  // 刺杀
+  const n = g.playerCount;
+  const targetGrid = numGrid(n, '', i => res.assassinTarget === i ? 'sel-leader' : '', i => { res.assassinTarget = res.assassinTarget === i ? null : i; save(); renderResult(); });
+  const hitRow = el('div', { class: 'opt-row' },
+    el('button', { class: 'opt' + (res.assassinHitMerlin === true ? ' sel-isnt' : ''), type: 'button', onclick: () => { res.assassinHitMerlin = res.assassinHitMerlin === true ? null : true; save(); renderResult(); } }, '刺中梅林'),
+    el('button', { class: 'opt' + (res.assassinHitMerlin === false ? ' sel-is' : ''), type: 'button', onclick: () => { res.assassinHitMerlin = res.assassinHitMerlin === false ? null : false; save(); renderResult(); } }, '没刺中'));
+
+  box.append(
+    el('div', { class: 'rcard' }, el('div', { class: 'sec-label' }, '胜负'), winRow),
+    el('div', { class: 'rcard' }, el('div', { class: 'sec-label' }, '任务结果（点「失败」后可调失败票数）'), missionsWrap),
+    el('div', { class: 'rcard' }, el('div', { class: 'sec-label' }, '刺杀'),
+      el('div', { class: 'sec-label', style: 'margin-top:2px;' }, '坏人刺谁（选号码）'), targetGrid, hitRow),
+    el('div', { class: 'rcard' },
+      el('div', { class: 'sec-label' }, '导出 / 名册'),
+      el('button', { class: 'primary-btn', type: 'button', onclick: exportCurrent }, '导出本局'),
+      el('div', { class: 'quick-row' },
+        el('button', { class: 'mini-btn', type: 'button', onclick: exportAll }, '导出全部（含存档）'),
+        el('button', { class: 'mini-btn', type: 'button', onclick: openRosterSheet }, '管理名册')),
+      el('div', { class: 'legend', style: 'margin-top:8px;' },
+        el('span', {}, '导出为 JSON：优先弹分享菜单（存到「文件」/ AirDrop / 发给其它 App），否则走下载。')))
+  );
+}
+
+/* ---------------- 存档 & 导出 ---------------- */
+function gameHasContent(g) {
+  if (!g) return false;
+  if ((g.rounds || []).length) return true;
+  if (g.players && Object.values(g.players).some(p => p && p.tags && p.tags.length)) return true;
+  if (g.seats && Object.keys(g.seats).length) return true;
+  const r = g.result || {};
+  if (r.winner) return true;
+  if ((r.missions || []).some(m => m && m.result)) return true;
+  if (r.assassinTarget != null || r.assassinHitMerlin != null) return true;
+  return false;
+}
+function archiveCurrent() {
+  const g = store.current;
+  if (!gameHasContent(g)) return;
+  const snap = JSON.parse(JSON.stringify(g));
+  store.archive = (store.archive || []).filter(x => x.id !== snap.id);
+  store.archive.push(snap);
+  if (store.archive.length > 100) store.archive = store.archive.slice(-100);
+}
+function buildGameExport(g) {
+  const players = [];
+  for (let num = 1; num <= g.playerCount; num++) {
+    const tags = (g.players[num] && g.players[num].tags) || [];
+    const finalIdentities = tags.filter(t => t.c === 'final').map(t => t.id);
+    const guesses = tags.filter(t => t.c !== 'final').map(t => ({
+      certainty: t.c, certaintyLabel: (CERT_LABEL[t.c] || {}).label || t.c, identity: t.id
+    }));
+    const pid = g.seats[num] || null;
+    const votes = [], proposals = [];
+    (g.rounds || []).forEach((r, i) => {
+      if (r.votes && r.votes[num]) votes.push({ round: i + 1, vote: r.votes[num] });
+      if (r.leader === num) proposals.push({ round: i + 1, team: (r.team || []).slice().sort((a, b) => a - b) });
+    });
+    players.push({
+      seat: num,
+      person: pid ? { id: pid, name: personName(pid) } : null,
+      finalIdentities,   // 「最终是」标记 = 揭底真实身份（标准答案）
+      guesses,           // 主观猜测：确定是/可能是/可能不是/确定不是
+      actions: { proposalsAsLeader: proposals, votes }
+    });
+  }
+  const rounds = (g.rounds || []).map((r, i) => ({
+    index: i + 1,
+    leader: (r.leader == null ? null : r.leader),
+    team: (r.team || []).slice().sort((a, b) => a - b),
+    votes: Object.assign({}, r.votes || {})
+  }));
+  const res = g.result || {};
+  return {
+    id: g.id,
+    createdAt: g.createdAt || null,
+    playerCount: g.playerCount,
+    players,
+    rounds,
+    result: {
+      winner: res.winner || null,
+      missions: (res.missions || []).map((m, i) => ({
+        index: i + 1,
+        result: (m && m.result) || null,
+        fails: (m && typeof m.fails === 'number') ? m.fails : null
+      })),
+      assassin: { target: (res.assassinTarget == null ? null : res.assassinTarget), hitMerlin: (res.assassinHitMerlin == null ? null : res.assassinHitMerlin) }
+    }
+  };
+}
+function collectAllGames() {
+  const map = new Map();
+  const add = g => { if (gameHasContent(g)) map.set(g.id, buildGameExport(g)); };
+  (store.archive || []).forEach(add);
+  add(store.previous);
+  add(store.current);
+  return Array.from(map.values());
+}
+function pad2(x) { return (x < 10 ? '0' : '') + x; }
+function fileStamp() {
+  const d = new Date();
+  return d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate()) + '_' + pad2(d.getHours()) + pad2(d.getMinutes());
+}
+async function saveJSON(filename, obj) {
+  const text = JSON.stringify(obj, null, 2);
+  const blob = new Blob([text], { type: 'application/json' });
+  // iOS 优先：系统分享菜单（存到「文件」/ AirDrop / 发给其它 App）
+  try {
+    if (navigator.canShare) {
+      const file = new File([blob], filename, { type: 'application/json' });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: filename });
+        return;
+      }
+    }
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;   // 用户在分享菜单里取消
+    /* 其它错误：落到下载兜底 */
+  }
+  const url = URL.createObjectURL(blob);
+  const a = el('a', { href: url, download: filename });
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+  toast('已生成 JSON 文件');
+}
+function exportCurrent() {
+  const g = G();
+  if (!gameHasContent(g)) { toast('本局还没有任何内容'); return; }
+  saveJSON('avalon_' + fileStamp() + '_' + g.id + '.json',
+    { format: 'avalon-tracker-game', formatVersion: 1, exportedAt: new Date().toISOString(), game: buildGameExport(g) });
+}
+function exportAll() {
+  const games = collectAllGames();
+  if (games.length === 0) { toast('还没有可导出的对局'); return; }
+  saveJSON('avalon_all_' + fileStamp() + '.json',
+    { format: 'avalon-tracker-games', formatVersion: 1, exportedAt: new Date().toISOString(), count: games.length, games });
+}
+
+/* ---------------- 密码闸门 ---------------- */
+async function sha256Hex(s) {
+  if (!(window.crypto && window.crypto.subtle)) throw new Error('no-subtle');
+  const buf = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function authValid() {
+  try {
+    const a = JSON.parse(localStorage.getItem(AUTH_KEY));
+    return !!(a && a.exp && Date.now() < a.exp);
+  } catch (e) { return false; }
+}
+function grantAuth() {
+  localStorage.setItem(AUTH_KEY, JSON.stringify({ exp: Date.now() + UNLOCK_HOURS * 3600 * 1000 }));
+}
+function showLock() {
+  $('#lock-screen').classList.remove('hidden');
+  const i = $('#lock-input');
+  if (i) { i.value = ''; setTimeout(() => { try { i.focus(); } catch (e) {} }, 50); }
+}
+function hideLock() { $('#lock-screen').classList.add('hidden'); }
+function lockNow() { localStorage.removeItem(AUTH_KEY); $('#lock-err').textContent = ''; showLock(); }
+async function attemptUnlock() {
+  const errEl = $('#lock-err');
+  const val = $('#lock-input').value || '';
+  if (!val) { errEl.textContent = '请输入密码'; return; }
+  let h;
+  try { h = await sha256Hex(val); }
+  catch (e) { errEl.textContent = '当前环境无法校验（需 https），请用 GitHub Pages 地址打开'; return; }
+  if (h === PASSWORD_HASH) { grantAuth(); errEl.textContent = ''; hideLock(); }
+  else { errEl.textContent = '密码错误'; $('#lock-input').value = ''; }
+}
+
 /* ---------------- 事件绑定 ---------------- */
 function bind() {
   document.querySelectorAll('.tab').forEach(b =>
@@ -369,11 +711,15 @@ function bind() {
   $('#btn-add-round').addEventListener('click', () => openRoundSheet());
   $('#sheet-close').addEventListener('click', closeSheet);
   $('#sheet-overlay').addEventListener('click', e => { if (e.target.id === 'sheet-overlay') closeSheet(); });
+  $('#btn-lock').addEventListener('click', lockNow);
+  $('#lock-btn').addEventListener('click', attemptUnlock);
+  $('#lock-input').addEventListener('keydown', e => { if (e.key === 'Enter') attemptUnlock(); });
 }
 
 /* ---------------- 启动 ---------------- */
 bind();
 render();
+if (authValid()) hideLock(); else showLock();
 
 /* Service Worker：离线可用 */
 if ('serviceWorker' in navigator) {

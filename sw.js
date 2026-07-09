@@ -1,6 +1,6 @@
 /* 阿瓦隆记牌器 —— Service Worker
  * 更新应用后，把下面的 VERSION 改一下（如 v2、v3…），即可让所有设备拉到新版本。 */
-const VERSION = 'v2';
+const VERSION = 'v4';
 const CACHE = 'avalon-tracker-' + VERSION;
 
 const ASSETS = [
