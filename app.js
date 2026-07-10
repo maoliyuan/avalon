@@ -69,13 +69,14 @@ function loadStore() {
     if (s && s.current && Array.isArray(s.current.rounds)) {
       s.roster = Array.isArray(s.roster) ? s.roster : [];
       s.archive = Array.isArray(s.archive) ? s.archive : [];
+      s.seatsDay = (typeof s.seatsDay === 'string') ? s.seatsDay : null;
       migrateGame(s.current);
       if (s.previous) migrateGame(s.previous);
       s.archive.forEach(migrateGame);
       return s;
     }
   } catch (e) { /* 损坏则重建 */ }
-  return { current: freshGame(10), previous: null, roster: [], archive: [] };
+  return { current: freshGame(10), previous: null, roster: [], archive: [], seatsDay: beijingDay() };
 }
 let store = loadStore();
 function save() { localStorage.setItem(LS_KEY, JSON.stringify(store)); }
@@ -111,6 +112,23 @@ function assignSeat(num, personId) {
     delete g.seats[num];
   }
   save();
+}
+
+/* 北京时间(UTC+8)日期串 YYYY-MM-DD —— 座位「每天 0 点重置」的判据 */
+function beijingDay() {
+  try {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai' }).format(new Date());
+  } catch (e) {
+    const d = new Date(Date.now() + 8 * 3600 * 1000);   // 兜底：手动 +8 小时
+    return d.getUTCFullYear() + '-' + pad2(d.getUTCMonth() + 1) + '-' + pad2(d.getUTCDate());
+  }
+}
+/* 跨天则重置当前局座位；名册(store.roster)始终保留。返回是否发生了重置。 */
+function ensureSeatDay() {
+  const today = beijingDay();
+  if (store.seatsDay == null) { store.seatsDay = today; save(); return false; }
+  if (store.seatsDay !== today) { store.current.seats = {}; store.seatsDay = today; save(); return true; }
+  return false;
 }
 
 /* 身份标记操作 */
@@ -425,15 +443,20 @@ function changeCount(delta) {
 }
 
 function newGame() {
-  if (!confirm('新开一局？当前记录会存档（可在「结果 / 导出」页「导出全部」找回），也可用「回溯上一局」切回上一局。')) return;
+  if (!confirm('新开一局？当前记录会存档（可在「结果 / 导出」页「导出全部」找回），也可用「回溯上一局」切回上一局。真实玩家座位会沿用（每天北京时间 0 点自动重置）。')) return;
   const count = G().playerCount;
   archiveCurrent();
+  const today = beijingDay();
+  const sameDay = (store.seatsDay === today);
+  const carried = sameDay ? Object.assign({}, store.current.seats) : {};   // 同一天沿用座位，跨天则清空
+  store.seatsDay = today;
   store.previous = store.current;
   store.current = freshGame(count);
+  store.current.seats = carried;
   save();
   activeTab = 'identity';
   render();
-  toast('已新开一局（上一局已存档）');
+  toast(sameDay ? '已新开一局（玩家座位已沿用）' : '已新开一局（新的一天，座位已重置）');
 }
 
 function rollback() {
@@ -718,6 +741,7 @@ function bind() {
 
 /* ---------------- 启动 ---------------- */
 bind();
+ensureSeatDay();   // 跨天(北京时间 0 点)则重置当前局座位
 render();
 if (authValid()) hideLock(); else showLock();
 
