@@ -352,6 +352,14 @@ main { padding: 12px; }
 .seat-btn.has { color: var(--text); border-color: var(--gold); }
 .seat-btn:active { filter: brightness(1.12); }
 
+/* 「我」标记：标出自己座位，卡片高亮 */
+.me-btn {
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--muted);
+  border-radius: 16px; height: 28px; padding: 0 12px; font-size: 13px; font-weight: 600;
+}
+.me-btn.on { background: var(--gold); color: #2a2205; border-color: var(--gold); }
+.pcard.me-card { border-color: var(--gold); box-shadow: 0 0 0 1px var(--gold) inset; }
+
 /* ---------- 结果 / 导出 页 ---------- */
 .result-panel { display: flex; flex-direction: column; gap: 10px; }
 .result-panel .rcard > .sec-label { margin-bottom: 8px; }

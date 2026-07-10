@@ -32,6 +32,7 @@ const STANDARD_EVIL = { 5: 2, 6: 2, 7: 3, 8: 3, 9: 3, 10: 4, 11: 4, 12: 4 };
 const CONFIG_ROLES = ['梅林', '派西维尔', '莫甘娜', '刺客', '莫德雷德', '奥伯伦', '蓝兰斯洛特', '红兰斯洛特'];
 const MY_ROLES = ['梅林', '派西维尔', '忠臣', '刺客', '莫甘娜', '莫德雷德', '奥伯伦', '爪牙', '蓝兰斯洛特', '红兰斯洛特'];
 const GOOD_ROLES = new Set(['好人', '梅林', '派西维尔', '忠臣', '蓝兰斯洛特']);
+const EVIL_ROLES = new Set(['坏人', '刺客', '莫甘娜', '莫德雷德', '奥伯伦', '爪牙', '红兰斯洛特']);
 function factionOf(role) { return role ? (GOOD_ROLES.has(role) ? 'good' : 'evil') : null; }
 
 /* ---------------- 密码闸门（纯客户端，仅用于挡住路人）----------------
@@ -80,6 +81,10 @@ function migrateGame(g) {
   if (!g.config) g.config = { evilCount: null, roles: [] };
   if (!g.me) g.me = { seat: null, role: null };
   if (!g.night) g.night = { evilsSeen: [], thumbs: [], evilAllies: [] };
+  else if (Array.isArray(g.night.evilAllies)) {
+    // 旧格式 evilAllies:[int] -> 新格式 [{seat,role}]
+    g.night.evilAllies = g.night.evilAllies.map(a => (a && typeof a === 'object') ? a : { seat: a, role: null });
+  }
   if (typeof g.review !== 'string') g.review = '';
   if (typeof g.analyzeSeq !== 'number') g.analyzeSeq = 0;
   return g;
@@ -233,7 +238,9 @@ function chipEl(num, tag, idx) {
 function renderIdentity() {
   const box = $('#identity-list');
   box.textContent = '';
-  const n = G().playerCount;
+  const g = G();
+  syncMe(g);   // 标记里确定了自己身份就同步到 me.role
+  const n = g.playerCount;
   for (let num = 1; num <= n; num++) {
     const tags = tagsOf(num);
     const chips = el('div', { class: 'chips' });
@@ -245,12 +252,17 @@ function renderIdentity() {
       class: 'seat-btn' + (pid ? ' has' : ''), type: 'button',
       onclick: () => openSeatSheet(num)
     }, pid ? personName(pid) : '指派玩家');
+    const isMe = g.me.seat === num;
+    const meBtn = el('button', {
+      class: 'me-btn' + (isMe ? ' on' : ''), type: 'button',
+      onclick: () => { setMySeat(g, num); renderIdentity(); }
+    }, isMe ? '✓我' : '我');
 
-    box.append(el('div', { class: 'pcard' },
+    box.append(el('div', { class: 'pcard' + (isMe ? ' me-card' : '') },
       el('div', { class: 'pcard-head' },
         el('div', { class: 'pnum-wrap' },
           el('div', { class: 'pnum' }, String(num), el('small', {}, '号')),
-          seatBtn),
+          seatBtn, meBtn),
         el('button', { class: 'add-tag', type: 'button', onclick: () => openTagSheet(num) }, '＋ 标记')),
       chips));
   }
@@ -477,6 +489,7 @@ function newGame() {
   store.current = freshGame(count);
   store.current.seats = carried;
   save();
+  assistMessages = [];        // 新开一局：清空上一局的助手对话
   activeTab = 'identity';
   render();
   toast(sameDay ? '已新开一局（玩家座位已沿用）' : '已新开一局（新的一天，座位已重置）');
@@ -549,8 +562,6 @@ function renderResult() {
   const res = g.result || (g.result = freshResult());
   if (!Array.isArray(res.missions)) res.missions = [];
 
-  buildAssistCards(box, g);   // 本局配置 / 我的身份 / 夜间情报 / 助手动作（置顶）
-
   // 胜负
   const winRow = el('div', { class: 'opt-row' });
   [['good', '好人赢', 'is'], ['evil', '坏人赢', 'isnt']].forEach(([code, label, cls]) => {
@@ -589,15 +600,7 @@ function renderResult() {
     el('div', { class: 'rcard' }, el('div', { class: 'sec-label' }, '胜负'), winRow),
     el('div', { class: 'rcard' }, el('div', { class: 'sec-label' }, '任务结果（点「失败」后可调失败票数）'), missionsWrap),
     el('div', { class: 'rcard' }, el('div', { class: 'sec-label' }, '刺杀'),
-      el('div', { class: 'sec-label', style: 'margin-top:2px;' }, '坏人刺谁（选号码）'), targetGrid, hitRow),
-    el('div', { class: 'rcard' },
-      el('div', { class: 'sec-label' }, '导出 / 名册'),
-      el('button', { class: 'primary-btn', type: 'button', onclick: exportCurrent }, '导出本局'),
-      el('div', { class: 'quick-row' },
-        el('button', { class: 'mini-btn', type: 'button', onclick: exportAll }, '导出全部（含存档）'),
-        el('button', { class: 'mini-btn', type: 'button', onclick: openRosterSheet }, '管理名册')),
-      el('div', { class: 'legend', style: 'margin-top:8px;' },
-        el('span', {}, '导出为 JSON：优先弹分享菜单（存到「文件」/ AirDrop / 发给其它 App），否则走下载。')))
+      el('div', { class: 'sec-label', style: 'margin-top:2px;' }, '坏人刺谁（选号码）'), targetGrid, hitRow)
   );
 }
 
@@ -800,10 +803,38 @@ function effectiveEvil(g) {
   if (g.config && typeof g.config.evilCount === 'number' && g.config.evilCount > 0) return g.config.evilCount;
   return STANDARD_EVIL[g.playerCount] || null;
 }
+
+/* ---- 我的身份/座位：单一真相，两个页面共享；「最终是」标在自己座位上=权威 ---- */
+function finalRoleOf(g, seat) {   // 某座位的「最终是」角色（具体角色优先于 好人/坏人）
+  const p = g.players[seat]; const tags = (p && p.tags) || [];
+  const finals = tags.filter(t => t.c === 'final').map(t => t.id);
+  if (!finals.length) return null;
+  return finals.find(r => r !== '好人' && r !== '坏人') || finals[0];
+}
+function myRole(g) {   // 优先读"我座位的最终身份"(我不会给自己标错)，否则用 me.role
+  return (g.me.seat && finalRoleOf(g, g.me.seat)) || g.me.role || null;
+}
+function syncMe(g) {   // 标记里若确定了自己座位的最终身份，就以它为准
+  if (g.me.seat) { const r = finalRoleOf(g, g.me.seat); if (r) g.me.role = r; }
+}
+function setMySeat(g, seat) {
+  g.me.seat = (g.me.seat === seat) ? null : seat;
+  syncMe(g); save();
+}
+function setMyRole(g, role) {   // 在结果/助手里选角色 = 同时写进自己座位的「最终是」
+  g.me.role = (g.me.role === role) ? null : role;
+  const chosen = g.me.role;
+  if (g.me.seat) {
+    const p = g.players[g.me.seat] || (g.players[g.me.seat] = { tags: [] });
+    p.tags = (p.tags || []).filter(t => t.c !== 'final');   // 自己座位的最终身份就一个
+    if (chosen) p.tags.push({ c: 'final', id: chosen });
+  }
+  save();
+}
 function assistCommon(g) {
   return {
     config: { playerCount: g.playerCount, evilCount: effectiveEvil(g), roles: (g.config.roles || []).slice() },
-    me: { seat: g.me.seat || null, role: g.me.role || null },
+    me: { seat: g.me.seat || null, role: myRole(g) },
     nightIntel: {
       evilsSeen: (g.night.evilsSeen || []).slice(),
       thumbs: (g.night.thumbs || []).slice(),
@@ -873,26 +904,44 @@ async function handleDownMessage(data) {
 function toggleInArr(arr, v) { const i = arr.indexOf(v); if (i >= 0) arr.splice(i, 1); else arr.push(v); }
 
 function buildNightCard(g) {
-  const role = g.me.role, fac = factionOf(role), n = g.playerCount;
+  const role = myRole(g), fac = factionOf(role), n = g.playerCount;
   const card = el('div', { class: 'rcard' }, el('div', { class: 'sec-label' }, '夜间情报（我亲眼所见，作为硬事实）'));
   if (role === '梅林') {
     card.append(el('div', { class: 'sec-label', style: 'margin-top:2px;' }, '梅林看到的坏人（可能不含莫德雷德）'),
-      numGrid(n, '', i => g.night.evilsSeen.includes(i) ? 'sel-team' : '', i => { toggleInArr(g.night.evilsSeen, i); save(); renderResult(); }));
+      numGrid(n, '', i => g.night.evilsSeen.includes(i) ? 'sel-team' : '', i => { toggleInArr(g.night.evilsSeen, i); save(); renderAssist(); }));
   } else if (role === '派西维尔') {
     card.append(el('div', { class: 'sec-label', style: 'margin-top:2px;' }, '两个拇指（梅林/莫甘娜各一，选 2 个）'),
       numGrid(n, '', i => g.night.thumbs.includes(i) ? 'sel-team' : '', i => {
         const a = g.night.thumbs;
         if (a.includes(i)) toggleInArr(a, i);
         else { if (a.length >= 2) { toast('拇指只有 2 个'); return; } a.push(i); }
-        save(); renderResult();
+        save(); renderAssist();
       }));
   } else if (fac === 'evil' && role !== '奥伯伦') {
-    card.append(el('div', { class: 'sec-label', style: 'margin-top:2px;' }, '我的坏队友（可能不含奥伯伦）'),
-      numGrid(n, '', i => g.night.evilAllies.includes(i) ? 'sel-team' : '', i => { toggleInArr(g.night.evilAllies, i); save(); renderResult(); }));
+    const allies = g.night.evilAllies;   // [{seat, role}]
+    const findA = s => allies.find(a => a.seat === s);
+    card.append(el('div', { class: 'sec-label', style: 'margin-top:2px;' }, '我的坏队友（点号码添加；下面可指定每人身份；可能不含奥伯伦）'),
+      numGrid(n, '', i => findA(i) ? 'sel-team' : '', i => {
+        const a = findA(i);
+        if (a) allies.splice(allies.indexOf(a), 1);
+        else allies.push({ seat: i, role: null });
+        save(); renderAssist();
+      }));
+    // 坏人互认身份：每个队友单独指定是什么坏（只列在场的坏角色；不点=只知是坏）
+    const evilOpts = (g.config.roles || []).filter(r => EVIL_ROLES.has(r));
+    const opts = evilOpts.length ? evilOpts : ['刺客', '莫甘娜', '莫德雷德', '奥伯伦', '爪牙', '红兰斯洛特'];
+    allies.slice().sort((x, y) => x.seat - y.seat).forEach(a => {
+      const row = el('div', { class: 'mrow' }, el('span', { class: 'rlabel' }, a.seat + '号'));
+      opts.forEach(rr => row.append(el('button', {
+        class: 'mini-btn' + (a.role === rr ? ' m-suc' : ''), type: 'button',
+        onclick: () => { a.role = (a.role === rr) ? null : rr; save(); renderAssist(); }
+      }, rr)));
+      card.append(row);
+    });
   } else if (role) {
     card.append(el('div', { class: 'empty-tags' }, role + ' 没有夜间情报'));
   } else {
-    card.append(el('div', { class: 'empty-tags' }, '先在上面选「我的角色」'));
+    card.append(el('div', { class: 'empty-tags' }, '先选「我的角色」，或在「身份标记」里给自己标「最终是」'));
   }
   return card;
 }
@@ -902,25 +951,26 @@ function buildAssistCards(box, g) {
   const rolesRow = el('div', { class: 'opt-row' });
   CONFIG_ROLES.forEach(r => {
     const on = (g.config.roles || []).includes(r);
-    rolesRow.append(el('button', { class: 'opt' + (on ? ' sel-is' : ''), type: 'button', onclick: () => { toggleInArr(g.config.roles, r); save(); renderResult(); } }, r));
+    rolesRow.append(el('button', { class: 'opt' + (on ? ' sel-is' : ''), type: 'button', onclick: () => { toggleInArr(g.config.roles, r); save(); renderAssist(); } }, r));
   });
   const cfgCard = el('div', { class: 'rcard' },
     el('div', { class: 'sec-label' }, '本局配置'),
     el('div', { class: 'mrow' },
       el('span', { class: 'rlabel' }, '坏人数'),
-      el('button', { class: 'step-btn', type: 'button', onclick: () => { const c = effectiveEvil(g) || 1; g.config.evilCount = Math.max(1, c - 1); save(); renderResult(); } }, '−'),
+      el('button', { class: 'step-btn', type: 'button', onclick: () => { const c = effectiveEvil(g) || 1; g.config.evilCount = Math.max(1, c - 1); save(); renderAssist(); } }, '−'),
       el('span', { class: 'fail-n' }, String(ev || '?')),
-      el('button', { class: 'step-btn', type: 'button', onclick: () => { const c = effectiveEvil(g) || 0; g.config.evilCount = Math.min(g.playerCount - 1, c + 1); save(); renderResult(); } }, '＋'),
+      el('button', { class: 'step-btn', type: 'button', onclick: () => { const c = effectiveEvil(g) || 0; g.config.evilCount = Math.min(g.playerCount - 1, c + 1); save(); renderAssist(); } }, '＋'),
       el('span', { class: 'vote-tag' }, g.config.evilCount == null ? '(默认按人数)' : '')),
     el('div', { class: 'sec-label', style: 'margin-top:6px;' }, '在场特殊角色'), rolesRow);
 
-  const meSeatGrid = numGrid(g.playerCount, '', i => g.me.seat === i ? 'sel-leader' : '', i => { g.me.seat = g.me.seat === i ? null : i; save(); renderResult(); });
+  const meSeatGrid = numGrid(g.playerCount, '', i => g.me.seat === i ? 'sel-leader' : '', i => { setMySeat(g, i); renderAssist(); });
   const roleRow = el('div', { class: 'opt-row' });
+  const curRole = myRole(g);
   MY_ROLES.forEach(r => {
-    roleRow.append(el('button', { class: 'opt' + (g.me.role === r ? ' sel-is' : ''), type: 'button', onclick: () => { g.me.role = g.me.role === r ? null : r; save(); renderResult(); } }, r));
+    roleRow.append(el('button', { class: 'opt' + (curRole === r ? ' sel-is' : ''), type: 'button', onclick: () => { setMyRole(g, r); renderAssist(); } }, r));
   });
   const meCard = el('div', { class: 'rcard' },
-    el('div', { class: 'sec-label' }, '我的身份'),
+    el('div', { class: 'sec-label' }, '我的身份（与「身份标记」里对自己的标记双向同步）'),
     el('div', { class: 'sec-label', style: 'margin-top:2px;' }, '我坐几号'), meSeatGrid,
     el('div', { class: 'sec-label', style: 'margin-top:6px;' }, '我的角色'), roleRow);
 
@@ -928,28 +978,32 @@ function buildAssistCards(box, g) {
   reviewTa.value = g.review || '';
   reviewTa.addEventListener('input', () => { g.review = reviewTa.value; save(); });
   const actCard = el('div', { class: 'rcard' },
-    el('div', { class: 'sec-label' }, '助手 / 发送到本地'),
-    el('button', { class: 'primary-btn', type: 'button', onclick: sendAnalyze }, '🔍 用助手分析（发到本地 → 钉钉）'),
+    el('div', { class: 'sec-label' }, '发送到本地助手'),
+    el('button', { class: 'primary-btn', type: 'button', onclick: sendAnalyze }, '🔍 用助手分析（→ 钉钉）'),
     el('div', { class: 'quick-row' },
-      el('button', { class: 'mini-btn', type: 'button', onclick: sendExport }, '发送本局到本地（导出）'),
-      el('button', { class: 'mini-btn', type: 'button', onclick: openSettingsSheet }, '频道设置')),
+      el('button', { class: 'mini-btn', type: 'button', onclick: sendExport }, '发送本局到本地（存档）')),
     el('div', { class: 'sec-label', style: 'margin-top:8px;' }, '复盘'), reviewTa,
     el('button', { class: 'mini-btn', type: 'button', onclick: sendReview }, '发送复盘到本地'));
 
   box.append(cfgCard, meCard, buildNightCard(g), actCard);
 }
 
-/* ---- 助手页（聊天 + 消息记录 + 设置） ---- */
+/* ---- 助手页：频道 + 本局配置/我的身份/夜间情报/发送 + 聊天 + 助手消息 + 工具 ---- */
 function renderAssist() {
   const box = $('#assist-panel');
   box.textContent = '';
+  const g = G();
+  syncMe(g);
   const custom = !!settings().channelSecret;
+
   box.append(el('div', { class: 'rcard' },
     el('div', { class: 'sec-label' }, '频道'),
     el('div', { class: 'vote-tag' }, '零配置可用' + (custom ? '（已设自定义密钥）' : '（内置盐，手机/电脑无需传密钥）') + '，每 ' + Math.round(channelWindow() / 60) + ' 分钟自动换名'),
     el('div', { class: 'quick-row', style: 'margin-top:6px;' },
       el('button', { class: 'mini-btn', type: 'button', onclick: openSettingsSheet }, '频道设置'),
       el('button', { class: 'mini-btn', type: 'button', onclick: () => { esTopicKey = ''; startDownlink(); toast('已重连'); } }, '重连'))));
+
+  buildAssistCards(box, g);   // 本局配置 / 我的身份 / 夜间情报 / 发送动作
 
   const ta = el('textarea', { class: 'review-ta', rows: '2', placeholder: '问助手点什么…（会带上当前对局）' });
   box.append(el('div', { class: 'rcard' },
@@ -964,7 +1018,21 @@ function renderAssist() {
       el('div', { class: 'assist-who' }, who),
       el('div', { class: 'assist-text' }, m.text)));
   });
-  box.append(el('div', { class: 'rcard' }, el('div', { class: 'sec-label' }, '助手消息'), log));
+  box.append(el('div', { class: 'rcard' },
+    el('div', { class: 'rcard-head' },
+      el('div', { class: 'sec-label' }, '助手消息'),
+      el('button', {
+        class: 'mini-btn', type: 'button',
+        onclick: () => { if (assistMessages.length && confirm('清空所有助手消息？')) { assistMessages = []; renderAssist(); } }
+      }, '清空')),
+    log));
+
+  box.append(el('div', { class: 'rcard' },
+    el('div', { class: 'sec-label' }, '工具'),
+    el('div', { class: 'quick-row' },
+      el('button', { class: 'mini-btn', type: 'button', onclick: exportCurrent }, '导出本局为文件'),
+      el('button', { class: 'mini-btn', type: 'button', onclick: exportAll }, '导出全部'),
+      el('button', { class: 'mini-btn', type: 'button', onclick: openRosterSheet }, '管理名册'))));
 }
 
 function openSettingsSheet() {
