@@ -489,7 +489,6 @@ function newGame() {
   store.current = freshGame(count);
   store.current.seats = carried;
   save();
-  assistMessages = [];        // 新开一局：清空上一局的助手对话
   activeTab = 'identity';
   render();
   toast(sameDay ? '已新开一局（玩家座位已沿用）' : '已新开一局（新的一天，座位已重置）');
@@ -746,14 +745,8 @@ async function upTopics() {
   const idx = windowIndex(channelWindow());
   return [await deriveTopic(channelSecret(), 'up', idx), await deriveTopic(channelSecret(), 'up', idx - 1)];
 }
-async function downTopicsJoin() {
-  const idx = windowIndex(channelWindow());
-  const a = await deriveTopic(channelSecret(), 'down', idx);
-  const b = await deriveTopic(channelSecret(), 'down', idx - 1);
-  return a + ',' + b;
-}
 
-/* ---- 载荷编解码（大于 ~3KB 时 gzip+base64；和 Python 一致）---- */
+/* ---- 载荷编码（大于 ~3KB 时 gzip+base64；和 Python 一致）---- */
 async function gzipB64(text) {
   if (typeof CompressionStream === 'undefined') return null;
   const cs = new CompressionStream('gzip');
@@ -761,20 +754,6 @@ async function gzipB64(text) {
   let bin = ''; const bytes = new Uint8Array(buf);
   for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
   return btoa(bin);
-}
-async function decodePayloadJS(text) {
-  if (!text) return null;
-  let obj; try { obj = JSON.parse(text); } catch (e) { return null; }
-  if (obj && obj.enc === 'gzip+b64' && typeof obj.data === 'string' && typeof DecompressionStream !== 'undefined') {
-    try {
-      const bin = atob(obj.data); const bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      const ds = new DecompressionStream('gzip');
-      const out = await new Response(new Blob([bytes]).stream().pipeThrough(ds)).arrayBuffer();
-      obj = JSON.parse(new TextDecoder().decode(out));
-    } catch (e) { return null; }
-  }
-  return obj;
 }
 
 /* ---- 上行发送 ---- */
@@ -863,42 +842,10 @@ async function sendChat(text) {
   const g = G();
   const ok = await sendToLocal('chat', Object.assign(
     { gameId: g.id, text, game: buildGameExport(g) }, assistCommon(g)));
-  if (ok) { assistMessages.unshift({ kind: 'me', text, ts: Date.now() }); renderAssist(); }
+  if (ok) toast('已发送，回复见钉钉');
 }
 
-/* ---- 下行接收（EventSource 订阅 down 频道，窗口滚动自动换）---- */
-let assistMessages = [];
-let seenDownMids = new Set();
-let esDown = null;
-let esTopicKey = '';
-function startDownlink() {
-  if (typeof EventSource === 'undefined') return;
-  if (!channelSecret()) return;
-  downTopicsJoin().then(key => {
-    if (key === esTopicKey && esDown) return;   // 频道没变，不重连
-    if (esDown) { try { esDown.close(); } catch (e) {} }
-    esTopicKey = key;
-    esDown = new EventSource(ntfyBase() + '/' + key + '/sse?since=' + channelWindow() + 's');   // since 回放，补窗口滚动/重连缺口(靠 mid 去重)
-    esDown.onmessage = ev => handleDownMessage(ev.data);
-    esDown.onerror = () => { /* EventSource 会自动重连 */ };
-  }).catch(() => {});
-}
-async function handleDownMessage(data) {
-  let env; try { env = JSON.parse(data); } catch (e) { return; }
-  if (env && env.event && env.event !== 'message') return;   // open/keepalive 忽略
-  const body = (env && typeof env.message === 'string') ? env.message : data;
-  const obj = await decodePayloadJS(body);
-  if (!obj || typeof obj.text !== 'string') return;
-  if (obj.mid) {                          // 本地双发(current+previous) -> 按 mid 去重
-    if (seenDownMids.has(obj.mid)) return;
-    seenDownMids.add(obj.mid);
-    if (seenDownMids.size > 300) seenDownMids = new Set(Array.from(seenDownMids).slice(-150));
-  }
-  assistMessages.unshift({ kind: obj.kind || 'reply', text: obj.text, ts: Date.now() });
-  if (assistMessages.length > 60) assistMessages.length = 60;
-  if (activeTab === 'assist') renderAssist();
-  else toast('助手有新消息（在「助手」页查看）');
-}
+/* ---- 下游输出已改为「只发钉钉」：本地不再经 ntfy 回传，PWA 也不再订阅下行。 ---- */
 
 /* ---- 本局配置 / 我的身份 / 夜间情报 / 助手动作（结果页顶部） ---- */
 function toggleInArr(arr, v) { const i = arr.indexOf(v); if (i >= 0) arr.splice(i, 1); else arr.push(v); }
@@ -1000,8 +947,7 @@ function renderAssist() {
     el('div', { class: 'sec-label' }, '频道'),
     el('div', { class: 'vote-tag' }, '零配置可用' + (custom ? '（已设自定义密钥）' : '（内置盐，手机/电脑无需传密钥）') + '，每 ' + Math.round(channelWindow() / 60) + ' 分钟自动换名'),
     el('div', { class: 'quick-row', style: 'margin-top:6px;' },
-      el('button', { class: 'mini-btn', type: 'button', onclick: openSettingsSheet }, '频道设置'),
-      el('button', { class: 'mini-btn', type: 'button', onclick: () => { esTopicKey = ''; startDownlink(); toast('已重连'); } }, '重连'))));
+      el('button', { class: 'mini-btn', type: 'button', onclick: openSettingsSheet }, '频道设置'))));
 
   buildAssistCards(box, g);   // 本局配置 / 我的身份 / 夜间情报 / 发送动作
 
@@ -1010,22 +956,9 @@ function renderAssist() {
     el('div', { class: 'sec-label' }, '聊天'), ta,
     el('button', { class: 'primary-btn', type: 'button', onclick: () => { const t = ta.value; ta.value = ''; sendChat(t); } }, '发送')));
 
-  const log = el('div', { class: 'assist-log' });
-  if (assistMessages.length === 0) log.append(el('span', { class: 'empty-tags' }, '还没有消息。'));
-  assistMessages.forEach(m => {
-    const who = m.kind === 'me' ? '我' : (m.kind === 'ack' ? '系统' : '助手');
-    log.append(el('div', { class: 'assist-msg' + (m.kind === 'me' ? ' mine' : '') },
-      el('div', { class: 'assist-who' }, who),
-      el('div', { class: 'assist-text' }, m.text)));
-  });
   box.append(el('div', { class: 'rcard' },
-    el('div', { class: 'rcard-head' },
-      el('div', { class: 'sec-label' }, '助手消息'),
-      el('button', {
-        class: 'mini-btn', type: 'button',
-        onclick: () => { if (assistMessages.length && confirm('清空所有助手消息？')) { assistMessages = []; renderAssist(); } }
-      }, '清空')),
-    log));
+    el('div', { class: 'sec-label' }, '助手消息'),
+    el('div', { class: 'vote-tag' }, '分析 / 回复 / 回执都发送到钉钉查看，不在本页显示。')));
 
   box.append(el('div', { class: 'rcard' },
     el('div', { class: 'sec-label' }, '工具'),
@@ -1048,7 +981,7 @@ function openSettingsSheet() {
     el('button', { class: 'primary-btn', type: 'button', onclick: () => {
       s.channelSecret = secIn.value.trim();
       s.ntfyBase = baseIn.value.trim() || NTFY_DEFAULT_BASE;
-      save(); esTopicKey = ''; startDownlink(); closeSheet(); toast('已保存');
+      save(); closeSheet(); toast('已保存');
     } }, '保存'));
 }
 
@@ -1106,8 +1039,6 @@ bind();
 ensureSeatDay();   // 跨天(北京时间 0 点)则重置当前局座位
 render();
 if (authValid()) hideLock(); else showLock();
-startDownlink();                       // 订阅下行频道(助手回复)
-setInterval(startDownlink, 60000);     // 频道窗口滚动时自动换名重连
 
 /* Service Worker：离线可用 */
 if ('serviceWorker' in navigator) {
