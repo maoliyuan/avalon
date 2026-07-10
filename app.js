@@ -23,6 +23,17 @@ const MIN_PLAYERS = 5;
 const MAX_PLAYERS = 12;
 const LS_KEY = 'avalon_tracker_v1';
 
+/* ---------------- 实时助手：频道 & 角色常量 ---------------- */
+const NTFY_DEFAULT_BASE = 'https://ntfy.sh';
+const CHANNEL_WINDOW = 600;     // 频道轮换窗口(秒)=10min，必须和本地 workflow 一致
+// 内置盐：与本地 channel.py 的 CHANNEL_SALT 必须一致。默认用它 => 手机/电脑都不用手动传密钥
+const CHANNEL_SALT = 'avalon-tracker-shared-v1';
+const STANDARD_EVIL = { 5: 2, 6: 2, 7: 3, 8: 3, 9: 3, 10: 4, 11: 4, 12: 4 };
+const CONFIG_ROLES = ['梅林', '派西维尔', '莫甘娜', '刺客', '莫德雷德', '奥伯伦', '蓝兰斯洛特', '红兰斯洛特'];
+const MY_ROLES = ['梅林', '派西维尔', '忠臣', '刺客', '莫甘娜', '莫德雷德', '奥伯伦', '爪牙', '蓝兰斯洛特', '红兰斯洛特'];
+const GOOD_ROLES = new Set(['好人', '梅林', '派西维尔', '忠臣', '蓝兰斯洛特']);
+function factionOf(role) { return role ? (GOOD_ROLES.has(role) ? 'good' : 'evil') : null; }
+
 /* ---------------- 密码闸门（纯客户端，仅用于挡住路人）----------------
  * 注意：静态网页无后端，此校验可被懂技术者绕过；仅防随手乱点。
  * PASSWORD_HASH = 你的密码的 SHA-256（十六进制小写）。
@@ -50,6 +61,11 @@ function freshGame(count) {
     rounds: [],
     seats: {},          // 座位号 -> 真实玩家 id
     result: freshResult(),
+    config: { evilCount: null, roles: [] },   // 本局配置(坏人数/在场特殊角色)
+    me: { seat: null, role: null },           // 我的座位/身份
+    night: { evilsSeen: [], thumbs: [], evilAllies: [] }, // 夜间私密情报(硬事实)
+    review: '',                               // 一整局复盘文字
+    analyzeSeq: 0,                            // 「用助手分析」递增序号
   };
 }
 /* 兼容旧存档：补齐后加的字段 */
@@ -61,6 +77,11 @@ function migrateGame(g) {
   if (!Array.isArray(g.rounds)) g.rounds = [];
   if (!g.seats) g.seats = {};
   if (!g.result) g.result = freshResult();
+  if (!g.config) g.config = { evilCount: null, roles: [] };
+  if (!g.me) g.me = { seat: null, role: null };
+  if (!g.night) g.night = { evilsSeen: [], thumbs: [], evilAllies: [] };
+  if (typeof g.review !== 'string') g.review = '';
+  if (typeof g.analyzeSeq !== 'number') g.analyzeSeq = 0;
   return g;
 }
 function loadStore() {
@@ -70,13 +91,14 @@ function loadStore() {
       s.roster = Array.isArray(s.roster) ? s.roster : [];
       s.archive = Array.isArray(s.archive) ? s.archive : [];
       s.seatsDay = (typeof s.seatsDay === 'string') ? s.seatsDay : null;
+      s.settings = (s.settings && typeof s.settings === 'object') ? s.settings : {};
       migrateGame(s.current);
       if (s.previous) migrateGame(s.previous);
       s.archive.forEach(migrateGame);
       return s;
     }
   } catch (e) { /* 损坏则重建 */ }
-  return { current: freshGame(10), previous: null, roster: [], archive: [], seatsDay: beijingDay() };
+  return { current: freshGame(10), previous: null, roster: [], archive: [], seatsDay: beijingDay(), settings: {} };
 }
 let store = loadStore();
 function save() { localStorage.setItem(LS_KEY, JSON.stringify(store)); }
@@ -190,13 +212,14 @@ let activeTab = 'identity';
 function render() {
   $('#count-val').textContent = G().playerCount;
   $('#btn-rollback').disabled = !store.previous;
-  ['identity', 'rounds', 'result'].forEach(t =>
+  ['identity', 'rounds', 'result', 'assist'].forEach(t =>
     $('#tab-' + t).classList.toggle('hidden', activeTab !== t));
   document.querySelectorAll('.tab').forEach(b =>
     b.classList.toggle('active', b.dataset.tab === activeTab));
   if (activeTab === 'identity') renderIdentity();
   else if (activeTab === 'rounds') renderRounds();
-  else renderResult();
+  else if (activeTab === 'result') renderResult();
+  else renderAssist();
 }
 
 function chipEl(num, tag, idx) {
@@ -526,6 +549,8 @@ function renderResult() {
   const res = g.result || (g.result = freshResult());
   if (!Array.isArray(res.missions)) res.missions = [];
 
+  buildAssistCards(box, g);   // 本局配置 / 我的身份 / 夜间情报 / 助手动作（置顶）
+
   // 胜负
   const winRow = el('div', { class: 'opt-row' });
   [['good', '好人赢', 'is'], ['evil', '坏人赢', 'isnt']].forEach(([code, label, cls]) => {
@@ -690,6 +715,275 @@ function exportAll() {
     { format: 'avalon-tracker-games', formatVersion: 1, exportedAt: new Date().toISOString(), count: games.length, games });
 }
 
+/* ============================================================
+ * 实时助手：轮换频道 / ntfy 收发 / 本局配置·我的身份·夜间情报 / 聊天·复盘
+ * ============================================================ */
+
+/* ---- 设置访问 ---- */
+function settings() { if (!store.settings) store.settings = {}; return store.settings; }
+function ntfyBase() { return (settings().ntfyBase || NTFY_DEFAULT_BASE).replace(/\/$/, ''); }
+function channelSecret() { return settings().channelSecret || CHANNEL_SALT; }   // 没设就用内置盐(免手动传)
+function channelWindow() { return settings().channelWindow || CHANNEL_WINDOW; }
+
+/* ---- 频道名派生（必须和本地 Python channel.py 完全一致）----
+ * topic = "avalon-{dir}-" + HMAC_SHA256(secret, "{dir}:{windowIndex}") 前16位hex
+ */
+async function hmacHex(secret, msg) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function windowIndex(win) { return Math.floor(Date.now() / 1000 / win); }
+async function deriveTopic(secret, dir, idx) {
+  return 'avalon-' + dir + '-' + (await hmacHex(secret, dir + ':' + idx)).slice(0, 16);
+}
+async function upTopic() { return deriveTopic(channelSecret(), 'up', windowIndex(channelWindow())); }
+async function upTopics() {
+  const idx = windowIndex(channelWindow());
+  return [await deriveTopic(channelSecret(), 'up', idx), await deriveTopic(channelSecret(), 'up', idx - 1)];
+}
+async function downTopicsJoin() {
+  const idx = windowIndex(channelWindow());
+  const a = await deriveTopic(channelSecret(), 'down', idx);
+  const b = await deriveTopic(channelSecret(), 'down', idx - 1);
+  return a + ',' + b;
+}
+
+/* ---- 载荷编解码（大于 ~3KB 时 gzip+base64；和 Python 一致）---- */
+async function gzipB64(text) {
+  if (typeof CompressionStream === 'undefined') return null;
+  const cs = new CompressionStream('gzip');
+  const buf = await new Response(new Blob([new TextEncoder().encode(text)]).stream().pipeThrough(cs)).arrayBuffer();
+  let bin = ''; const bytes = new Uint8Array(buf);
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+async function decodePayloadJS(text) {
+  if (!text) return null;
+  let obj; try { obj = JSON.parse(text); } catch (e) { return null; }
+  if (obj && obj.enc === 'gzip+b64' && typeof obj.data === 'string' && typeof DecompressionStream !== 'undefined') {
+    try {
+      const bin = atob(obj.data); const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const ds = new DecompressionStream('gzip');
+      const out = await new Response(new Blob([bytes]).stream().pipeThrough(ds)).arrayBuffer();
+      obj = JSON.parse(new TextDecoder().decode(out));
+    } catch (e) { return null; }
+  }
+  return obj;
+}
+
+/* ---- 上行发送 ---- */
+async function postNtfy(topic, obj) {
+  let body = JSON.stringify(obj);
+  if (new Blob([body]).size > 3000) {
+    const b64 = await gzipB64(body);
+    if (b64) body = JSON.stringify({ enc: 'gzip+b64', data: b64 });
+  }
+  const res = await fetch(ntfyBase() + '/' + topic, { method: 'POST', body });
+  if (!res.ok) throw new Error('ntfy ' + res.status);
+}
+async function sendToLocal(kind, extra) {
+  if (!channelSecret()) { toast('请先在「助手」页设置频道密钥'); return false; }
+  try {
+    const topics = await upTopics();
+    const evt = Object.assign({ v: 1, kind, mid: genId('m'), ts: new Date().toISOString() }, extra || {});
+    for (const t of topics) await postNtfy(t, evt);   // 双发 current+previous，防窗口边界丢消息(本地按 mid 去重)
+    toast('已发送到本地助手');
+    return true;
+  } catch (e) { toast('发送失败：' + (e.message || e)); return false; }
+}
+
+/* ---- 组装分析载荷 ---- */
+function effectiveEvil(g) {
+  if (g.config && typeof g.config.evilCount === 'number' && g.config.evilCount > 0) return g.config.evilCount;
+  return STANDARD_EVIL[g.playerCount] || null;
+}
+function assistCommon(g) {
+  return {
+    config: { playerCount: g.playerCount, evilCount: effectiveEvil(g), roles: (g.config.roles || []).slice() },
+    me: { seat: g.me.seat || null, role: g.me.role || null },
+    nightIntel: {
+      evilsSeen: (g.night.evilsSeen || []).slice(),
+      thumbs: (g.night.thumbs || []).slice(),
+      evilAllies: (g.night.evilAllies || []).slice(),
+    },
+  };
+}
+async function sendAnalyze() {
+  const g = G(); g.analyzeSeq = (g.analyzeSeq || 0) + 1; save();
+  await sendToLocal('analyze', Object.assign(
+    { gameId: g.id, seq: g.analyzeSeq, label: g.label || null, game: buildGameExport(g) }, assistCommon(g)));
+}
+async function sendExport() {
+  const g = G();
+  await sendToLocal('export', Object.assign(
+    { gameId: g.id, review: g.review || '', game: buildGameExport(g) }, assistCommon(g)));
+}
+async function sendReview() {
+  const g = G(); const text = (g.review || '').trim();
+  if (!text) { toast('复盘内容为空'); return; }
+  await sendToLocal('review', Object.assign(
+    { gameId: g.id, text, game: buildGameExport(g) }, assistCommon(g)));
+}
+async function sendChat(text) {
+  text = (text || '').trim(); if (!text) return;
+  const g = G();
+  const ok = await sendToLocal('chat', Object.assign(
+    { gameId: g.id, text, game: buildGameExport(g) }, assistCommon(g)));
+  if (ok) { assistMessages.unshift({ kind: 'me', text, ts: Date.now() }); renderAssist(); }
+}
+
+/* ---- 下行接收（EventSource 订阅 down 频道，窗口滚动自动换）---- */
+let assistMessages = [];
+let seenDownMids = new Set();
+let esDown = null;
+let esTopicKey = '';
+function startDownlink() {
+  if (typeof EventSource === 'undefined') return;
+  if (!channelSecret()) return;
+  downTopicsJoin().then(key => {
+    if (key === esTopicKey && esDown) return;   // 频道没变，不重连
+    if (esDown) { try { esDown.close(); } catch (e) {} }
+    esTopicKey = key;
+    esDown = new EventSource(ntfyBase() + '/' + key + '/sse?since=' + channelWindow() + 's');   // since 回放，补窗口滚动/重连缺口(靠 mid 去重)
+    esDown.onmessage = ev => handleDownMessage(ev.data);
+    esDown.onerror = () => { /* EventSource 会自动重连 */ };
+  }).catch(() => {});
+}
+async function handleDownMessage(data) {
+  let env; try { env = JSON.parse(data); } catch (e) { return; }
+  if (env && env.event && env.event !== 'message') return;   // open/keepalive 忽略
+  const body = (env && typeof env.message === 'string') ? env.message : data;
+  const obj = await decodePayloadJS(body);
+  if (!obj || typeof obj.text !== 'string') return;
+  if (obj.mid) {                          // 本地双发(current+previous) -> 按 mid 去重
+    if (seenDownMids.has(obj.mid)) return;
+    seenDownMids.add(obj.mid);
+    if (seenDownMids.size > 300) seenDownMids = new Set(Array.from(seenDownMids).slice(-150));
+  }
+  assistMessages.unshift({ kind: obj.kind || 'reply', text: obj.text, ts: Date.now() });
+  if (assistMessages.length > 60) assistMessages.length = 60;
+  if (activeTab === 'assist') renderAssist();
+  else toast('助手有新消息（在「助手」页查看）');
+}
+
+/* ---- 本局配置 / 我的身份 / 夜间情报 / 助手动作（结果页顶部） ---- */
+function toggleInArr(arr, v) { const i = arr.indexOf(v); if (i >= 0) arr.splice(i, 1); else arr.push(v); }
+
+function buildNightCard(g) {
+  const role = g.me.role, fac = factionOf(role), n = g.playerCount;
+  const card = el('div', { class: 'rcard' }, el('div', { class: 'sec-label' }, '夜间情报（我亲眼所见，作为硬事实）'));
+  if (role === '梅林') {
+    card.append(el('div', { class: 'sec-label', style: 'margin-top:2px;' }, '梅林看到的坏人（可能不含莫德雷德）'),
+      numGrid(n, '', i => g.night.evilsSeen.includes(i) ? 'sel-team' : '', i => { toggleInArr(g.night.evilsSeen, i); save(); renderResult(); }));
+  } else if (role === '派西维尔') {
+    card.append(el('div', { class: 'sec-label', style: 'margin-top:2px;' }, '两个拇指（梅林/莫甘娜各一，选 2 个）'),
+      numGrid(n, '', i => g.night.thumbs.includes(i) ? 'sel-team' : '', i => {
+        const a = g.night.thumbs;
+        if (a.includes(i)) toggleInArr(a, i);
+        else { if (a.length >= 2) { toast('拇指只有 2 个'); return; } a.push(i); }
+        save(); renderResult();
+      }));
+  } else if (fac === 'evil' && role !== '奥伯伦') {
+    card.append(el('div', { class: 'sec-label', style: 'margin-top:2px;' }, '我的坏队友（可能不含奥伯伦）'),
+      numGrid(n, '', i => g.night.evilAllies.includes(i) ? 'sel-team' : '', i => { toggleInArr(g.night.evilAllies, i); save(); renderResult(); }));
+  } else if (role) {
+    card.append(el('div', { class: 'empty-tags' }, role + ' 没有夜间情报'));
+  } else {
+    card.append(el('div', { class: 'empty-tags' }, '先在上面选「我的角色」'));
+  }
+  return card;
+}
+
+function buildAssistCards(box, g) {
+  const ev = effectiveEvil(g);
+  const rolesRow = el('div', { class: 'opt-row' });
+  CONFIG_ROLES.forEach(r => {
+    const on = (g.config.roles || []).includes(r);
+    rolesRow.append(el('button', { class: 'opt' + (on ? ' sel-is' : ''), type: 'button', onclick: () => { toggleInArr(g.config.roles, r); save(); renderResult(); } }, r));
+  });
+  const cfgCard = el('div', { class: 'rcard' },
+    el('div', { class: 'sec-label' }, '本局配置'),
+    el('div', { class: 'mrow' },
+      el('span', { class: 'rlabel' }, '坏人数'),
+      el('button', { class: 'step-btn', type: 'button', onclick: () => { const c = effectiveEvil(g) || 1; g.config.evilCount = Math.max(1, c - 1); save(); renderResult(); } }, '−'),
+      el('span', { class: 'fail-n' }, String(ev || '?')),
+      el('button', { class: 'step-btn', type: 'button', onclick: () => { const c = effectiveEvil(g) || 0; g.config.evilCount = Math.min(g.playerCount - 1, c + 1); save(); renderResult(); } }, '＋'),
+      el('span', { class: 'vote-tag' }, g.config.evilCount == null ? '(默认按人数)' : '')),
+    el('div', { class: 'sec-label', style: 'margin-top:6px;' }, '在场特殊角色'), rolesRow);
+
+  const meSeatGrid = numGrid(g.playerCount, '', i => g.me.seat === i ? 'sel-leader' : '', i => { g.me.seat = g.me.seat === i ? null : i; save(); renderResult(); });
+  const roleRow = el('div', { class: 'opt-row' });
+  MY_ROLES.forEach(r => {
+    roleRow.append(el('button', { class: 'opt' + (g.me.role === r ? ' sel-is' : ''), type: 'button', onclick: () => { g.me.role = g.me.role === r ? null : r; save(); renderResult(); } }, r));
+  });
+  const meCard = el('div', { class: 'rcard' },
+    el('div', { class: 'sec-label' }, '我的身份'),
+    el('div', { class: 'sec-label', style: 'margin-top:2px;' }, '我坐几号'), meSeatGrid,
+    el('div', { class: 'sec-label', style: 'margin-top:6px;' }, '我的角色'), roleRow);
+
+  const reviewTa = el('textarea', { class: 'review-ta', rows: '3', placeholder: '一整局结束后的复盘（谁是什么、关键失误…）' });
+  reviewTa.value = g.review || '';
+  reviewTa.addEventListener('input', () => { g.review = reviewTa.value; save(); });
+  const actCard = el('div', { class: 'rcard' },
+    el('div', { class: 'sec-label' }, '助手 / 发送到本地'),
+    el('button', { class: 'primary-btn', type: 'button', onclick: sendAnalyze }, '🔍 用助手分析（发到本地 → 钉钉）'),
+    el('div', { class: 'quick-row' },
+      el('button', { class: 'mini-btn', type: 'button', onclick: sendExport }, '发送本局到本地（导出）'),
+      el('button', { class: 'mini-btn', type: 'button', onclick: openSettingsSheet }, '频道设置')),
+    el('div', { class: 'sec-label', style: 'margin-top:8px;' }, '复盘'), reviewTa,
+    el('button', { class: 'mini-btn', type: 'button', onclick: sendReview }, '发送复盘到本地'));
+
+  box.append(cfgCard, meCard, buildNightCard(g), actCard);
+}
+
+/* ---- 助手页（聊天 + 消息记录 + 设置） ---- */
+function renderAssist() {
+  const box = $('#assist-panel');
+  box.textContent = '';
+  const custom = !!settings().channelSecret;
+  box.append(el('div', { class: 'rcard' },
+    el('div', { class: 'sec-label' }, '频道'),
+    el('div', { class: 'vote-tag' }, '零配置可用' + (custom ? '（已设自定义密钥）' : '（内置盐，手机/电脑无需传密钥）') + '，每 ' + Math.round(channelWindow() / 60) + ' 分钟自动换名'),
+    el('div', { class: 'quick-row', style: 'margin-top:6px;' },
+      el('button', { class: 'mini-btn', type: 'button', onclick: openSettingsSheet }, '频道设置'),
+      el('button', { class: 'mini-btn', type: 'button', onclick: () => { esTopicKey = ''; startDownlink(); toast('已重连'); } }, '重连'))));
+
+  const ta = el('textarea', { class: 'review-ta', rows: '2', placeholder: '问助手点什么…（会带上当前对局）' });
+  box.append(el('div', { class: 'rcard' },
+    el('div', { class: 'sec-label' }, '聊天'), ta,
+    el('button', { class: 'primary-btn', type: 'button', onclick: () => { const t = ta.value; ta.value = ''; sendChat(t); } }, '发送')));
+
+  const log = el('div', { class: 'assist-log' });
+  if (assistMessages.length === 0) log.append(el('span', { class: 'empty-tags' }, '还没有消息。'));
+  assistMessages.forEach(m => {
+    const who = m.kind === 'me' ? '我' : (m.kind === 'ack' ? '系统' : '助手');
+    log.append(el('div', { class: 'assist-msg' + (m.kind === 'me' ? ' mine' : '') },
+      el('div', { class: 'assist-who' }, who),
+      el('div', { class: 'assist-text' }, m.text)));
+  });
+  box.append(el('div', { class: 'rcard' }, el('div', { class: 'sec-label' }, '助手消息'), log));
+}
+
+function openSettingsSheet() {
+  const body = openSheet('频道设置');
+  const s = settings();
+  const secIn = el('input', { class: 'lock-input', type: 'text', placeholder: '频道密钥（和本地一致，越长越安全）', value: s.channelSecret || '' });
+  const baseIn = el('input', { class: 'lock-input', type: 'text', placeholder: 'ntfy 服务器', value: s.ntfyBase || NTFY_DEFAULT_BASE });
+  body.append(
+    el('div', { class: 'sheet-section' }, el('div', { class: 'sec-label' }, '频道密钥（可留空=默认零配置；若填，手机和电脑要一致，仅用于和别人隔离）'), secIn),
+    el('div', { class: 'sheet-section' }, el('div', { class: 'sec-label' }, 'ntfy 服务器'), baseIn),
+    el('div', { class: 'sheet-section' },
+      el('button', { class: 'mini-btn', type: 'button', onclick: () => { secIn.value = genId('sk') + genId('sk'); } }, '随机生成密钥')),
+    el('button', { class: 'primary-btn', type: 'button', onclick: () => {
+      s.channelSecret = secIn.value.trim();
+      s.ntfyBase = baseIn.value.trim() || NTFY_DEFAULT_BASE;
+      save(); esTopicKey = ''; startDownlink(); closeSheet(); toast('已保存');
+    } }, '保存'));
+}
+
 /* ---------------- 密码闸门 ---------------- */
 async function sha256Hex(s) {
   if (!(window.crypto && window.crypto.subtle)) throw new Error('no-subtle');
@@ -744,6 +1038,8 @@ bind();
 ensureSeatDay();   // 跨天(北京时间 0 点)则重置当前局座位
 render();
 if (authValid()) hideLock(); else showLock();
+startDownlink();                       // 订阅下行频道(助手回复)
+setInterval(startDownlink, 60000);     // 频道窗口滚动时自动换名重连
 
 /* Service Worker：离线可用 */
 if ('serviceWorker' in navigator) {
